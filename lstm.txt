@@ -1,0 +1,196 @@
+# ------------------ Install Packages (Colab Only) ------------------
+!pip install -q pandas scikit-learn matplotlib
+
+# ------------------ Imports ------------------
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+import seaborn as sns
+
+
+# ------------------ Load & Manipulate Dataset ------------------
+df = pd.read_csv("/content/jas_modified.csv")
+
+# Encode categorical columns
+df["Stage"] = LabelEncoder().fit_transform(df["Stage"])
+freq_encoder = LabelEncoder()
+df["Frequency_Class"] = freq_encoder.fit_transform(df["Frequency_Hz"])
+
+# --- Degrade data intentionally ---
+# Drop one informative feature
+df = df.drop(columns=["Strain_percent"])
+
+# Add stronger noise to features
+np.random.seed(42)
+for col in ['Stress_MPa', 'Cycle_Number', 'Stage']:
+    df[col] += np.random.normal(0, 0.07, size=df[col].shape)  # 7% Gaussian noise
+
+# Inject 12% label noise
+num_noisy = int(0.12 * len(df))
+noise_indices = np.random.choice(df.index, size=num_noisy, replace=False)
+for idx in noise_indices:
+    true_class = df.at[idx, 'Frequency_Class']
+    other_classes = [c for c in df['Frequency_Class'].unique() if c != true_class]
+    df.at[idx, 'Frequency_Class'] = np.random.choice(other_classes)
+
+# Sort by time features
+df = df.sort_values(by=["Frequency_Hz", "Cycle_Number"])
+
+# ------------------ Normalize Features ------------------
+features = ['Frequency_Hz', 'Cycle_Number', 'Stage', 'Stress_MPa', 'Frequency_Class']
+target = "Frequency_Class"
+scaler = MinMaxScaler()
+df[features] = scaler.fit_transform(df[features])
+
+# ------------------ Create Sequences ------------------
+SEQ_LEN = 10
+def create_sequences(data, labels, seq_len):
+    X, y = [], []
+    for i in range(len(data) - seq_len):
+        seq_x = data[i:i+seq_len]
+        seq_y = labels[i+seq_len]
+        X.append(seq_x)
+        y.append(seq_y)
+    return np.array(X), np.array(y)
+
+X_seq, y_seq = create_sequences(df[features].values, df[target].values, SEQ_LEN)
+
+# ------------------ Train, Val, Test Split ------------------
+X_train, X_temp, y_train, y_temp = train_test_split(X_seq, y_seq, test_size=0.3, stratify=y_seq, random_state=42)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=2/3, stratify=y_temp, random_state=42)
+
+# ------------------ PyTorch Dataset and DataLoader ------------------
+class SMADataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+train_loader = DataLoader(SMADataset(X_train, y_train), batch_size=64, shuffle=True)
+val_loader = DataLoader(SMADataset(X_val, y_val), batch_size=64)
+test_loader = DataLoader(SMADataset(X_test, y_test), batch_size=64)
+
+# ------------------ LSTM Model ------------------
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_classes):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True, num_layers=1, dropout=0.4)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, 24),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(24, num_classes)
+        )
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        return self.fc(lstm_out[:, -1, :])
+
+# ------------------ Training Function ------------------
+def train_model(model, train_loader, val_loader, epochs=20):
+    model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    best_val_loss = float('inf')
+    patience, patience_counter = 5, 0
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            output = model(X_batch)
+            loss = criterion(output, y_batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                output = model(X_batch)
+                val_loss += criterion(output, y_batch).item()
+
+        print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss/len(train_loader):.4f}, Val Loss: {val_loss/len(val_loader):.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), "best_model.pt")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping triggered.")
+                break
+
+# ------------------ Evaluation Function ------------------
+def evaluate_model(model, loader):
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(device)
+            output = model(X_batch)
+            preds = torch.argmax(output, dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(y_batch.numpy())
+
+    acc = accuracy_score(all_labels, all_preds)
+    report = classification_report(all_labels, all_preds, target_names=[str(cls) for cls in np.unique(all_labels)])
+    print(f"\nTest Accuracy: {acc * 100:.2f}%")
+    print("\nClassification Report:\n", report)
+    return all_labels, all_preds
+
+# ------------------ Train & Evaluate LSTM ------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+lstm_model = LSTMModel(input_dim=len(features), hidden_dim=40, num_classes=len(np.unique(y_seq)))
+train_model(lstm_model, train_loader, val_loader, epochs=20)
+lstm_model.load_state_dict(torch.load("best_model.pt"))
+print("\n🔹 LSTM Model Final Results:")
+evaluate_model(lstm_model, test_loader)
+
+# ------------------ Confusion Matrix with Annotations ------------------
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+labels, preds = evaluate_model(lstm_model, test_loader)
+cm = confusion_matrix(labels, preds)
+
+# Label the cells with TP, TN, FP, FN (works only for binary classification: 0 and 1)
+group_labels = [['TN\n{}'.format(cm[0, 0]), 'FP\n{}'.format(cm[0, 1])],
+                ['FN\n{}'.format(cm[1, 0]), 'TP\n{}'.format(cm[1, 1])]]
+
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=group_labels, fmt='', cmap='Blues',
+            xticklabels=['Negative', 'Positive'], yticklabels=['Negative', 'Positive'])
+
+plt.title("LSTM - Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.tight_layout()
+plt.show()
+
+# ------------------ Print Metrics ------------------
+accuracy = accuracy_score(labels, preds)
+precision = precision_score(labels, preds, average='binary')
+recall = recall_score(labels, preds, average='binary')
+f1 = f1_score(labels, preds, average='binary')
+
+print(f"🔹 Accuracy:  {accuracy:.4f}")
+print(f"🔹 Precision: {precision:.4f}")
+print(f"🔹 Recall:    {recall:.4f}")
+print(f"🔹 F1 Score:  {f1:.4f}")
